@@ -37,7 +37,11 @@ class SinusoidalPosEmb(nn.Module):
         return emb
 
 
-class BertForDiffusion(nn.Module, ModuleUtilsMixin):
+class BertForDiffusionAddSelfCondition(nn.Module, ModuleUtilsMixin):
+    """
+    Transformer model for diffusion.
+    Self condition embeddings are added to the decoder input embeddings
+    """
     def __init__(self,
                  config,
                  self_condition=False,
@@ -169,6 +173,170 @@ class BertForDiffusion(nn.Module, ModuleUtilsMixin):
         if self.self_condition and x_self_cond is not None:
             cond_embeddings = self.cond_proj(x_self_cond)
             embeddings += cond_embeddings
+
+        embeddings = self.LayerNorm(embeddings)
+        embeddings = self.dropout(embeddings)
+
+        if attention_mask is None:
+            attention_mask = torch.ones((batch_size, seq_length), device=x.device)
+
+        extended_attention_mask = self.invert_attention_mask(attention_mask,)
+        encoder_extended_attention_mask = self.invert_attention_mask(src_attention_mask, )
+
+        if self.conditional_gen:
+            encoder_outputs = self.input_transformer(hidden_states=embeddings,
+                                                     attention_mask=extended_attention_mask,
+                                                     encoder_hidden_states=encoder_hidden_states,
+                                                     encoder_attention_mask=encoder_extended_attention_mask,
+            ).last_hidden_state
+
+        else:
+            encoder_outputs = self.input_transformer(hidden_states=embeddings,
+                                                     attention_mask=extended_attention_mask).last_hidden_state
+
+        outputs = self.output_proj(encoder_outputs)
+
+        return outputs
+
+
+class BertForDiffusion(nn.Module, ModuleUtilsMixin):
+    """
+    Transformer model for diffusion.
+    Self condition embeddings are concatenated with the decoder input embeddings
+    """
+    def __init__(self,
+                 config,
+                 self_condition=False,
+                 time_emb_type='sin',
+                 conditional_gen=False,
+                 encoder_config=None,
+                 encoder_type='frozen',
+                 encoder_name_or_path='bert-base-uncased',):
+
+        super().__init__()
+        self.config = config
+        self.self_condition = self_condition
+        self.conditional_gen = conditional_gen
+
+        if conditional_gen:
+            assert encoder_type in ['frozen', 'fine-tune', 'from-scratch']
+            self.encoder_type = encoder_type
+
+            if encoder_type == 'frozen':    # use pretrained transformer encoder with frozen parameters
+                self.encoder = BertModel.from_pretrained(encoder_name_or_path).requires_grad_(False)
+                self.encoder_config = self.encoder.config
+
+            elif encoder_type == 'fine-tune':   # use pretrained transformer encoder and fine tune
+                self.encoder = BertModel.from_pretrained(encoder_name_or_path)
+                self.encoder_config = self.encoder.config
+
+            elif encoder_type == 'from-scratch':    # train encoder from scratch
+                if encoder_config is None:
+                    encoder_config = config
+                self.encoder_word_embeddings = nn.Embedding(encoder_config.vocab_size, encoder_config.hidden_size)
+                self.encoder_position_embeddings = nn.Embedding(encoder_config.max_position_embeddings,
+                                                                encoder_config.hidden_size)
+                self.encoder_LayerNorm = nn.LayerNorm(encoder_config.hidden_size, eps=encoder_config.layer_norm_eps)
+                self.encoder_dropout = nn.Dropout(encoder_config.hidden_dropout_prob)
+                self.register_buffer("encoder_position_ids",
+                                     torch.arange(encoder_config.max_position_embeddings).expand((1, -1)))
+                self.bert_encoder = BertEncoder(encoder_config)
+                self.encoder_config = encoder_config
+
+            else:
+                raise NotImplementedError
+
+            # input_transformer as decoder
+            config.is_decoder = True
+            config.add_cross_attention = True
+
+            self.encoder_output_proj = nn.Linear(self.encoder_config.hidden_size, config.hidden_size)
+
+        self.input_transformer = BertEncoder(config)
+
+        if self.self_condition:
+            # concatenate word
+            self.input_proj = nn.Sequential(nn.Linear(2 * config.word_embedding_dim, config.hidden_size),
+                                        nn.Tanh(), nn.Linear(config.hidden_size, config.hidden_size))
+        else:
+            self.input_proj = nn.Sequential(nn.Linear(config.word_embedding_dim, config.hidden_size),
+                                        nn.Tanh(), nn.Linear(config.hidden_size, config.hidden_size))
+        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+
+        self.time_emb_type = time_emb_type
+        if time_emb_type == 'abs':  # absolute time embedding
+            self.time_embeddings = nn.Embedding(config.T, config.hidden_size)
+        elif time_emb_type == 'sin':    # sinusoidal time embedding:
+            sinu_pos_emb = SinusoidalPosEmb(dim=config.hidden_size//4)
+            self.time_embeddings = nn.Sequential(
+                sinu_pos_emb,
+                nn.Linear(config.hidden_size//4, config.hidden_size),
+                nn.GELU(),
+                nn.Linear(config.hidden_size, config.hidden_size)
+            )
+        elif time_emb_type == 'none':   # do not add time embedding
+            pass
+        else:
+            raise NotImplementedError
+
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+        self.output_proj = nn.Sequential(nn.Linear(config.hidden_size, config.hidden_size),
+                                         nn.Tanh(), nn.Linear(config.hidden_size, config.word_embedding_dim))
+
+        self.register_buffer("position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)))
+
+    def forward(self, x, timesteps, x_self_cond=None, attention_mask=None, src_ids=None, src_attention_mask=None):
+        """
+        forward
+        :param x: input text embeddings [batch, seq, word_embedding_dim]
+        :param timesteps: time steps [batch,]
+        :param x_self_cond: previous predicted x_0 for self-conditioning [batch, seq, word_emb_dim]
+        :param attention_mask: attention mask [batch, seq]
+        :param src_ids: source input ids when conditional generation [batch, seq,]
+        :param src_attention_mask: source attention mask when conditional generation [batch, seq,]
+        :return: projecction of last hidden states of bert encoder [batch, seq, word_emb_dim]
+        """
+        batch_size = x.shape[0]
+        seq_length = x.shape[1]
+
+        if self.conditional_gen:
+
+            assert (src_ids is not None) and (src_attention_mask is not None)
+
+            if self.encoder_type in ['frozen', 'fine-tune']:
+                encoder_hidden_states = self.encoder(input_ids=src_ids,
+                                                     attention_mask=src_attention_mask).last_hidden_state
+
+            else:
+                encoder_input_embeddings = self.encoder_word_embeddings(src_ids)    # [batch, seq, encoder_hidden_size]
+                position_ids = self.position_ids[:, :src_ids.shape[1]]
+                encoder_position_embeddings = self.encoder_position_embeddings(position_ids)
+                encoder_embeddings = encoder_input_embeddings + encoder_position_embeddings
+                encoder_embeddings = self.encoder_LayerNorm(encoder_embeddings)
+                encoder_embeddings = self.encoder_dropout(encoder_embeddings)
+                encoder_extended_attention_mask = self.invert_attention_mask(src_attention_mask,)
+                encoder_hidden_states = self.bert_encoder(hidden_states=encoder_embeddings,
+                                                          attention_mask=encoder_extended_attention_mask
+                                                          ).last_hidden_state
+
+            encoder_hidden_states = self.encoder_output_proj(encoder_hidden_states)
+
+        if self.self_condition:
+            if x_self_cond is None:
+                x_self_cond = torch.zeros_like(x)
+            x = torch.cat((x, x_self_cond), dim = -1)
+
+        input_embeddings = self.input_proj(x)
+        position_ids = self.position_ids[:, :seq_length]
+        position_embeddings = self.position_embeddings(position_ids)
+        if self.time_emb_type == 'none':
+            time_embeddings = torch.zeros_like(input_embeddings)
+        else:
+            time_embeddings = self.time_embeddings(timesteps).unsqueeze(1).expand(-1, seq_length, -1)
+
+        embeddings = input_embeddings + position_embeddings + time_embeddings
 
         embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
