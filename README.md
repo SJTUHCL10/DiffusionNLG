@@ -21,7 +21,8 @@ Python script for training unconditional diffusion models.
 
 Python script for training conditional diffusion models.
 
-## [Metric Codes](metric_utils.py)
+## Metric Codes
+[metric_utils.py](metric_utils.py)
 
 BLEU and ROUGE metric.
 
