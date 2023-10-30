@@ -134,7 +134,8 @@ def build_qqp_dataset_and_tokenizer(max_len=32,
                                     vocab_threshold=5,
                                     bert_tokenzier_name='bert-base-uncased',
                                     save_dir=None):
-    qqp_dataset = datasets.load_dataset("glue", "qqp")
+    # qqp_dataset = datasets.load_dataset("glue", "qqp")
+    qqp_dataset = datasets.load_from_disk("data/qqp")
     qqp_paraphrase_dataset = qqp_dataset.filter(lambda example: example['label'] == 1)
 
     nlp = English()
